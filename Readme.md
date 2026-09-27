@@ -2,35 +2,25 @@
 
 A PostgreSQL migration tool for safely changing SQL-backed database objects while preserving their existing PostgreSQL types, dependencies, indexes, ownership, comments, and other catalog metadata.
 
-The tool is designed around **dependency-aware migrations** and supports migrating a managed family of related objects such as:
-
-```text
-v_loans_sch_info
-t_loans_sch_info
-mv_loans_sch_info
-```
-
-The SQL naming prefix (`v_`, `t_`, `mv_`) is a naming convention only. The actual PostgreSQL object type in the database is authoritative.
-
----
+The tool is designed around **dependency-aware migrations** and supports migrating a managed family of related objects.
 
 ## What it does
 
 `pg-view-migrator` can:
 
-* Discover managed object families.
-* Resolve migration SQL files to existing database objects.
-* Preserve the actual PostgreSQL object type.
-* Detect and follow PostgreSQL view/materialized-view dependencies.
-* Drop dependent objects before their referenced objects.
-* Recreate objects in dependency order.
-* Apply new SQL only to the explicitly migrated family objects.
-* Recreate downstream objects using their existing definitions.
-* Preserve indexes, ownership, comments, and materialized-view population state.
-* Recreate tables without data using `WITH NO DATA`.
-* Verify the resulting objects and dependency relationships after migration.
+- discover managed object families;
+- resolve migration SQL files to existing database objects;
+- preserve the actual PostgreSQL object type;
+- detect and follow PostgreSQL view/materialized-view dependencies;
+- drop dependent objects before their referenced objects;
+- recreate objects in dependency order;
+- apply new SQL only to explicitly migrated family objects;
+- recreate downstream objects from their existing database definitions;
+- preserve indexes, ownership, comments, and materialized-view populated/unpopulated state;
+- recreate tables with `WITH NO DATA`;
+- verify the resulting objects and captured dependency relationships.
 
-The intended workflow is:
+The operational flow is:
 
 ```text
 SQL files
@@ -46,163 +36,90 @@ Apply migration
 Verify database state
 ```
 
----
-
 ## Supported object types
 
 The migration engine supports:
 
-* TABLE
-* VIEW
-* MATERIALIZED VIEW
+- `TABLE`
+- `VIEW`
+- `MATERIALIZED VIEW`
 
-The existing PostgreSQL object type is preserved.
+The **existing PostgreSQL catalog type is authoritative**. Filename prefixes such as `v_`, `t_`, and `mv_` are naming conventions only.
 
-For example, if a file is named:
-
-```text
-mv_loans_sch_info.sql
-```
-
-but the existing object is actually:
-
-```text
-public.mv_loans_sch_info
-```
-
-with PostgreSQL type `VIEW`, the migration recreates it as a `VIEW`.
-
-It does **not** convert it to a materialized view merely because its name starts with `mv_`.
-
----
-
-## Migration SQL
-
-Migration SQL files contain the SQL/query that defines the object.
-
-For example:
-
-```sql
-CREATE VIEW public.mv_loans_sch_info AS
-SELECT
-    loan_schedule_id,
-    loan_id,
-    consumer_id
-FROM auto_views.t_loans_sch_info;
-```
-
-The migration engine extracts the query definition and combines it with the actual object metadata from PostgreSQL.
-
-For an existing table, the resulting migration uses:
-
-```sql
-CREATE TABLE schema.table AS
-<query>
-WITH NO DATA;
-```
-
-This means the migration recreates the table structure but does not copy data.
-
----
+For example, `mv_loans_sch_info.sql` does not force `public.mv_loans_sch_info` to become a materialized view. If the existing object is a PostgreSQL `VIEW`, it remains a `VIEW` after migration.
 
 ## Managed object families
 
-A managed family groups related objects by logical name.
-
-For example:
+A family groups related objects by logical name. For example:
 
 ```text
 loans_sch_info
 ```
 
-can correspond to:
+may resolve to:
 
 ```text
-auto_views.v_loans_sch_info
 auto_views.t_loans_sch_info
+auto_views.v_loans_sch_info
 public.mv_loans_sch_info
 ```
 
-The family is resolved from the database catalog.
+The family is resolved from the database catalog. If matching objects make the family ambiguous, the migration stops rather than guessing.
 
-If multiple matching objects make the family ambiguous, the migration is rejected rather than guessing.
+A schema-qualified SQL definition can be used when the published-view schema must be identified explicitly.
 
-A published-view schema can also be supplied through the schema-qualified migration SQL.
+## Migration SQL and dependency behavior
 
----
+Migration SQL defines the objects you intentionally want to change.
 
-## Dependency handling
+Objects explicitly supplied to `plan-family` / `apply-family` receive the supplied definition and appear in the plan as **`NEW SQL`**.
 
-Before migration, the tool discovers dependent PostgreSQL views and materialized views.
+Objects discovered only because they depend on the migrated family are normally recreated from their **existing database definitions** and appear as **`EXISTING SQL`**.
+
+This means changing one family does not silently replace the SQL definitions of downstream objects.
 
 Objects are dropped in dependency-safe order:
 
 ```text
-dependent objects
-        ↓
-referenced objects
+dependent → referenced
 ```
 
-They are recreated in the opposite direction:
+and recreated in the opposite direction:
 
 ```text
-referenced objects
-        ↓
-dependent objects
+referenced → dependent
 ```
-
-Downstream objects that are not part of the proposed family are recreated from their **existing database definitions**.
-
-For example:
-
-```text
-v_loans_sch_info       ← changed
-        ↓
-v_collection_base      ← existing definition
-        ↓
-v_merchant_branch_info ← existing definition
-```
-
-Only the explicitly supplied family SQL receives the new SQL definition.
-
----
 
 ## Schema changes
 
-Schema changes are supported.
-
-For example, a migration can add a new column to the family SQL:
-
-```sql
-'migration_schema_test' AS migration_schema_test
-```
-
-The affected family objects are recreated using the new definition.
+Schema changes are supported through the supplied family SQL. For example, adding a new output column to a family definition causes the affected family objects to be recreated using the new definition.
 
 Downstream objects retain their existing SQL definitions unless they are explicitly part of the migration family.
 
-After the migration, verification checks that the resulting objects match the proposed family definitions and that captured dependency relationships still exist.
-
----
+Post-migration verification checks the resulting objects and the captured dependency relationships.
 
 ## Metadata preservation
 
-The migration captures and restores relevant existing database metadata, including:
+Relevant existing metadata is captured/restored, including:
 
-* Object ownership
-* Object comments
-* Index definitions
-* Materialized-view populated/unpopulated state
+- ownership;
+- comments;
+- index definitions;
+- materialized-view populated/unpopulated state.
 
-Indexes are restored after the object has been recreated.
+Indexes are restored after object recreation.
 
-The migration does not infer metadata from object-name prefixes.
+## Tables and data
 
----
+Tables are recreated with:
 
-# Installation
+```sql
+WITH NO DATA
+```
 
-The project uses Python and PostgreSQL.
+Therefore the tool changes/recreates table structure but **does not copy table rows**. Any data backfill or population must be handled separately.
+
+## Installation
 
 Install the Python dependencies:
 
@@ -210,13 +127,7 @@ Install the Python dependencies:
 pip install -r requirements.txt
 ```
 
-The project expects PostgreSQL to be reachable using the environment variables described below.
-
----
-
-# Configuration
-
-Create a `.env` file in the project root.
+The project expects PostgreSQL connection settings in `.env`.
 
 Example:
 
@@ -228,78 +139,29 @@ PGUSER=postgres
 PGPASSWORD=YOUR_POSTGRES_PASSWORD
 ```
 
-The database can be changed by modifying:
+Always confirm `PGDATABASE` before applying a migration.
 
-```env
-PGDATABASE=...
-```
-
-For example:
-
-```env
-PGDATABASE=mylo_local
-```
-
-for the staging/rehearsal database.
-
----
-
-# Discovering a family
-
-Use:
+## Discover a family
 
 ```powershell
 python -m migrator discover loans_sch_info
 ```
 
-This is useful before creating a migration plan.
+Use discovery before planning so you can confirm the objects and schemas resolved from the target database.
 
-It shows the objects discovered for the logical family and helps identify schema ambiguity.
+## Plan a family migration
 
----
-
-# Planning a family migration
-
-Given:
-
-```text
-t_loans_sch_info.sql
-v_loans_sch_info.sql
-mv_loans_sch_info.sql
-```
-
-run:
+For example:
 
 ```powershell
 python -m migrator plan-family loans_sch_info t_loans_sch_info.sql v_loans_sch_info.sql mv_loans_sch_info.sql
 ```
 
-The plan shows:
+Review the complete plan. It shows the proposed objects, actual object types, `NEW SQL` / `EXISTING SQL` classification, dependency ordering, index restoration, and metadata restoration.
 
-* Proposed objects
-* Existing object types
-* Objects receiving new SQL
-* Objects retaining existing SQL
-* Drop order
-* Create order
-* Index restoration
-* Metadata restoration
+Do not apply an unexpected plan.
 
-Example:
-
-```text
-PROPOSED OBJECTS
-----------------
-auto_views.t_loans_sch_info
-auto_views.v_loans_sch_info
-public.mv_loans_sch_info
-```
-
-The plan should always be reviewed before applying a migration.
-
----
-
-# Applying a family migration
+## Apply a family migration
 
 After reviewing the plan:
 
@@ -307,309 +169,121 @@ After reviewing the plan:
 python -m migrator apply-family loans_sch_info t_loans_sch_info.sql v_loans_sch_info.sql mv_loans_sch_info.sql
 ```
 
-A successful migration ends with:
+A successful migration should end with:
 
 ```text
 FAMILY MIGRATION APPLIED SUCCESSFULLY
 VERIFICATION PASSED
 ```
 
-If migration execution fails, the transaction is rolled back.
+If execution fails, the migration transaction is rolled back. A successful SQL execution without `VERIFICATION PASSED` should not be treated as a completed migration.
 
----
+## Rehearsal workflow
 
-# Recommended workflow
+For a real migration:
 
-Use this workflow for a real migration:
+1. Prepare the SQL definitions for the objects intentionally being changed.
+2. Point `.env` at the rehearsal/schema-clone database.
+3. Run the automated tests:
 
-### 1. Prepare SQL files
+   ```powershell
+   python -m pytest -q
+   ```
 
-Prepare the SQL definitions for the objects being intentionally changed.
+4. Discover the family.
+5. Generate and review the migration plan.
+6. Apply the migration to the rehearsal database.
+7. Confirm `VERIFICATION PASSED`.
+8. Run relevant application-level checks.
+9. Point `.env` at the real target.
+10. Discover the family again on the target.
+11. Generate a fresh target plan and review it.
+12. Apply only after the target plan is confirmed.
+13. Run post-migration tests and application checks.
 
-### 2. Point the environment at the rehearsal database
+## Testing
 
-For example:
-
-```env
-PGDATABASE=mylo_local
-```
-
-### 3. Discover the family
-
-```powershell
-python -m migrator discover loans_sch_info
-```
-
-### 4. Generate the plan
-
-```powershell
-python -m migrator plan-family loans_sch_info t_loans_sch_info.sql v_loans_sch_info.sql mv_loans_sch_info.sql
-```
-
-### 5. Review the plan
-
-Confirm:
-
-* The intended objects are `NEW SQL`.
-* Unchanged downstream objects are `EXISTING SQL`.
-* Object types are correct.
-* Drop order is dependency-safe.
-* Create order is dependency-safe.
-* The expected indexes and metadata are preserved.
-
-### 6. Apply
-
-```powershell
-python -m migrator apply-family loans_sch_info t_loans_sch_info.sql v_loans_sch_info.sql mv_loans_sch_info.sql
-```
-
-### 7. Verify
-
-Do not consider the migration successful unless:
-
-```text
-VERIFICATION PASSED
-```
-
-is reported.
-
----
-
-# Testing
-
-Run the complete test suite:
+Run the complete suite:
 
 ```powershell
 python -m pytest -q
 ```
 
-Run the staging integration tests:
+Run the staging integration test when the staging/rehearsal database is configured:
 
 ```powershell
 python -m pytest tests/test_staging_family_migration.py -q
 ```
 
-The staging integration tests require:
+The repository's current documentation expects the staging integration environment to use `PGDATABASE=mylo_local`.
 
-```env
-PGDATABASE=mylo_local
-```
+## Rehearsal database
 
-Otherwise they are skipped.
-
----
-
-# Rehearsal database
-
-The project can be tested against a schema-only clone of the staging database.
-
-This is useful because it exercises:
-
-* Real PostgreSQL catalog structure
-* Real schemas
-* Real object types
-* Real cross-schema dependencies
-* Real indexes
-* Real downstream views
-* Real dependency ordering
-
-No production data is required for the schema rehearsal.
-
----
-
-# Important behavior
-
-## Existing object type is authoritative
-
-The SQL filename does not determine the PostgreSQL object type.
-
-For example:
-
-```text
-mv_example.sql
-```
-
-does not automatically mean:
-
-```sql
-CREATE MATERIALIZED VIEW
-```
-
-The migration uses the existing catalog object type.
-
----
-
-## Family SQL versus downstream SQL
-
-If an object is explicitly supplied as migration input:
-
-```text
-NEW SQL
-```
-
-is used.
-
-If an object is only discovered as a dependency:
-
-```text
-EXISTING SQL
-```
-
-is used.
-
-This prevents a migration from unintentionally replacing downstream SQL definitions.
-
----
-
-## Tables contain no data after recreation
-
-Tables are recreated with:
-
-```sql
-WITH NO DATA
-```
-
-The migration tool is intended to recreate table structure, not migrate table contents.
-
-Any required data population is expected to happen separately.
-
----
+The project can be exercised against a schema-only clone of the staging database. This is useful for testing real PostgreSQL schemas, object types, cross-schema dependencies, indexes, downstream views, and dependency ordering without requiring production data.
 
 ## Materialized views
 
-Materialized views preserve their previous populated state.
+For an existing materialized view, the migrator preserves whether it was populated or unpopulated.
 
-If an existing materialized view was unpopulated, it is recreated using:
+If it was unpopulated, recreation uses `WITH NO DATA`.
 
-```sql
-WITH NO DATA
-```
-
----
+Again, the filename does not determine whether an object is a materialized view.
 
 ## Dependency limitations
 
-PostgreSQL's dependency catalog records database-level dependencies.
+The dependency graph comes from PostgreSQL catalog information. External applications, jobs, ETL processes, and workflows can have relationships that PostgreSQL does not record.
 
-External systems that populate or manipulate tables may have relationships that PostgreSQL cannot discover.
+Those external dependencies must be validated separately during the migration.
 
-For example, an external workflow may populate a table from a view without PostgreSQL recording a dependency from the table to that view.
+## Safety checklist
 
-Those external dependencies must therefore be handled outside the database dependency graph.
+Before applying:
 
----
+1. Confirm the target database.
+2. Discover the family.
+3. Review the complete plan.
+4. Confirm actual PostgreSQL object types.
+5. Confirm intended objects are `NEW SQL`.
+6. Confirm unchanged downstream objects are `EXISTING SQL`.
+7. Review drop/create order.
+8. Rehearse against a safe database.
+9. Confirm `VERIFICATION PASSED`.
+10. Perform application-level validation.
 
-# Safety expectations
+Stop rather than guessing if the family is ambiguous, the target database is wrong, the plan is unexpected, object types are unexpected, or verification fails.
 
-Before applying a migration:
+## Troubleshooting
 
-1. Review the generated plan.
-2. Confirm the target database.
-3. Confirm the proposed object list.
-4. Confirm the `NEW SQL` / `EXISTING SQL` classification.
-5. Review drop and create order.
-6. Test the migration against the rehearsal database.
-7. Confirm verification passes.
+### Managed object family is ambiguous
 
-Do not run an unreviewed migration against a production database.
+Inspect the discovered objects and schemas. Do not guess. If multiple published views exist, use a schema-qualified published-view SQL definition to identify the intended object.
 
----
+### Duplicate column
 
-# Example Thursday procedure
+For `psycopg.errors.DuplicateColumn`, inspect the proposed SQL and ensure every output column has a unique name.
 
-For a migration affecting `loans_sch_info`:
+### Verification failed
 
-```powershell
-# 1. Configure the target database in .env
+Do not immediately retry. Inspect the migration SQL, generated plan, resulting object definitions, verification error, and target database configuration.
 
-# 2. Discover
-python -m migrator discover loans_sch_info
-
-# 3. Plan
-python -m migrator plan-family loans_sch_info t_loans_sch_info.sql v_loans_sch_info.sql mv_loans_sch_info.sql
-
-# 4. Review the complete plan
-
-# 5. Apply
-python -m migrator apply-family loans_sch_info t_loans_sch_info.sql v_loans_sch_info.sql mv_loans_sch_info.sql
-
-# 6. Run tests after the rehearsal
-python -m pytest -q
-```
-
-A successful application should report:
+## Repository layout
 
 ```text
-FAMILY MIGRATION APPLIED SUCCESSFULLY
-VERIFICATION PASSED
+.
+├── migrator/
+├── schema/
+├── tests/
+├── MIGRATION_RUNBOOK.md
+├── Readme.md
+├── migration_preview.txt
+├── rehearse_loans.py
+├── staging_structure.sql
+├── t_collection_base_changed.sql
+├── t_merchant_branch_changed.sql
+├── .env.example
+└── docker-compose.yml
 ```
 
----
+## Scope
 
-# Troubleshooting
-
-## Managed object family is ambiguous
-
-Example:
-
-```text
-ValueError: Managed object family is ambiguous
-```
-
-Check whether multiple matching objects exist in the database.
-
-If the family has multiple published views, use a schema-qualified published-view SQL definition so the intended schema can be resolved.
-
----
-
-## Duplicate column
-
-Example:
-
-```text
-psycopg.errors.DuplicateColumn
-```
-
-Inspect the generated/input SQL and make sure each output column has a unique name.
-
-For example, do not include both:
-
-```sql
-migration_test_marker,
-'migration_test_marker' AS migration_test_marker
-```
-
----
-
-## Verification failed
-
-Do not immediately retry.
-
-First inspect:
-
-* The migration SQL
-* The generated plan
-* The object definitions
-* The reported verification error
-* Whether the target database is the intended database
-
-The migration transaction is rolled back when execution itself fails.
-
----
-
-# Project status
-
-The migration engine has been tested against a staging-schema rehearsal covering:
-
-* Family discovery
-* Cross-schema objects
-* Dependency discovery
-* Dependency ordering
-* Existing versus proposed definitions
-* Actual PostgreSQL object types
-* Index preservation
-* Downstream object recreation
-* Schema changes
-* Post-migration verification
-
-The full automated test suite and staging integration tests should be run before operational use.
+`pg-view-migrator` is a PostgreSQL schema/object migration tool. It is not a general-purpose table-data migration or backfill system.
