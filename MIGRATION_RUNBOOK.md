@@ -1,374 +1,849 @@
-# PostgreSQL Migration Runbook
+# PostgreSQL Migration Tool Runbook
 
-## Purpose
-
-Operational procedure for running a `pg-view-migrator` family migration safely.
-
-The migration should be rehearsed against the staging/schema clone before the real target. The tool changes database objects; it does **not** migrate table rows.
+Operational guide for analyzing, reviewing, applying, and verifying PostgreSQL migrations with the Python migration tool.
 
 ---
 
-# 1. Pre-migration checks
+# 1. Purpose
 
-## 1.1 Confirm the project
+This runbook defines the standard procedure for running migrations safely.
 
-From the repository root:
+The tool is designed around:
 
-```powershell
-Get-ChildItem
-```
+* PostgreSQL dependency discovery
+* Managed object families
+* Explicit SQL definitions
+* Safe table alterations
+* Dependency-aware view recreation
+* Transactional execution
+* Post-migration verification
 
-Confirm the migration engine, tests, schema fixtures, and runbook are present.
+The standard rule is:
 
-For the `loans_sch_info` example, confirm the intended SQL files are present:
-
-```text
-t_loans_sch_info.sql
-v_loans_sch_info.sql
-mv_loans_sch_info.sql
-```
-
-## 1.2 Confirm the target database
-
-```powershell
-Get-Content .env
-```
-
-Verify:
-
-```text
-PGHOST
-PGPORT
-PGDATABASE
-PGUSER
-```
-
-are pointing to the intended database.
-
-**STOP if the target is wrong.**
+> Discover first, analyze second, plan third, apply last.
 
 ---
 
-# 2. Rehearsal
+# 2. Prerequisites
 
-## 2.1 Run the automated tests
+Before running a migration, confirm:
+
+* Python is installed.
+* The project environment is active.
+* PostgreSQL is reachable.
+* Database credentials are configured.
+* The SQL migration file exists.
+* You have permission to modify the target database.
+* A suitable production backup/snapshot exists when required.
+
+Check the project:
+
+```powershell
+cd C:\Users\OmarSobhy\Desktop\pg-view-migrator
+```
+
+Verify Python:
+
+```powershell
+python --version
+```
+
+Verify the application imports:
+
+```powershell
+python -c "import migrator; print(migrator.__file__)"
+```
+
+---
+
+# 3. Database Configuration
+
+The tool reads PostgreSQL configuration from environment variables.
+
+Typical local configuration:
+
+```text
+PGHOST=localhost
+PGPORT=5433
+PGDATABASE=testdb
+PGUSER=postgres
+PGPASSWORD=...
+```
+
+For production, use the appropriate production values.
+
+Never commit passwords or other database credentials to source control.
+
+---
+
+# 4. Validate the Code Before a Migration
+
+Run the complete test suite:
 
 ```powershell
 python -m pytest -q
 ```
 
-Investigate unexpected failures before continuing.
-
-## 2.2 Run the staging integration test
-
-When the staging/rehearsal database is configured as expected:
-
-```powershell
-$env:PGDATABASE="mylo_local"
-python -m pytest tests/test_staging_family_migration.py -q
-```
-
-Do not confuse a skipped integration test with a passing migration rehearsal.
-
-## 2.3 Discover the family
-
-```powershell
-python -m migrator discover loans_sch_info
-```
-
-For the current rehearsal example, confirm the expected family:
+Expected current baseline:
 
 ```text
-auto_views.t_loans_sch_info
-auto_views.v_loans_sch_info
-public.mv_loans_sch_info
+59 passed
 ```
 
-The database catalog, not the filename, determines the PostgreSQL object type.
+Use `python -m pytest` rather than the standalone `pytest` command when possible.
+
+On Windows, multiple Python installations can cause the standalone `pytest` executable to run under a different interpreter.
 
 ---
 
-# 3. Generate and review the migration plan
+# 5. Migration Input
+
+A migration SQL file normally contains the desired definition of the target object.
+
+Examples:
+
+```text
+v_collection_base_changed.sql
+offloading_securitization_changed.sql
+```
+
+For a managed family, the filename is not what determines family membership.
+
+The SQL object's schema/name is matched against the managed-family catalog.
+
+For example:
+
+```sql
+CREATE OR REPLACE VIEW auto_views.v_collection_base AS
+...
+```
+
+is resolved as:
+
+```text
+collection_base
+```
+
+when that object is registered as a managed family member.
+
+---
+
+# 6. Standard Migration Procedure
+
+## Step 1 — Discover
 
 Run:
 
 ```powershell
-python -m migrator plan-family loans_sch_info t_loans_sch_info.sql v_loans_sch_info.sql mv_loans_sch_info.sql
+python -m migrator discover change.sql
 ```
 
-Review the **entire** plan before applying it.
-
-## 3.1 Confirm family objects
-
-Objects explicitly supplied as migration inputs should be classified as:
-
-```text
-NEW SQL
-```
-
-For the example family, confirm the actual catalog types shown by the plan rather than assuming them from the prefixes.
-
-## 3.2 Confirm downstream objects
-
-Objects discovered only because they depend on the family should normally be:
-
-```text
-EXISTING SQL
-```
-
-unless they were intentionally included in the migration inputs.
-
-## 3.3 Confirm ordering
-
-Verify that:
-
-```text
-drop:   dependent → referenced
-create: referenced → dependent
-```
-
-Also review index restoration and metadata restoration.
-
-## 3.4 Stop conditions
-
-Do not apply if:
-
-- the family is ambiguous;
-- the target database is wrong;
-- an unexpected object appears;
-- an actual PostgreSQL object type is unexpected;
-- a family object is not receiving the intended `NEW SQL`;
-- an unchanged downstream object unexpectedly receives `NEW SQL`;
-- drop/create ordering is unexpected.
-
----
-
-# 4. Apply the rehearsal migration
-
-After the plan has been reviewed:
+Example:
 
 ```powershell
-python -m migrator apply-family loans_sch_info t_loans_sch_info.sql v_loans_sch_info.sql mv_loans_sch_info.sql
+python -m migrator discover v_collection_base_changed.sql
 ```
-
-A successful run should end with:
-
-```text
-FAMILY MIGRATION APPLIED SUCCESSFULLY
-VERIFICATION PASSED
-```
-
-If either expected result is missing, stop and investigate.
-
-If execution itself fails, the migration transaction is rolled back.
-
----
-
-# 5. Validate the rehearsal
-
-Confirm that:
-
-- intended family objects exist;
-- their actual PostgreSQL types are correct;
-- the new definitions are present on explicitly migrated objects;
-- downstream objects retain their existing definitions unless intentionally migrated;
-- indexes and relevant metadata were restored;
-- captured dependency relationships are still valid;
-- expected schema changes are present.
-
-For example, to inspect a new output column:
-
-```sql
-SELECT
-    table_schema,
-    table_name,
-    column_name,
-    data_type
-FROM information_schema.columns
-WHERE (table_schema, table_name) IN (
-    ('auto_views', 't_loans_sch_info'),
-    ('auto_views', 'v_loans_sch_info'),
-    ('public', 'mv_loans_sch_info')
-)
-AND column_name = 'migration_schema_test'
-ORDER BY table_schema, table_name;
-```
-
-### Important: table data
-
-Tables are recreated with:
-
-```sql
-WITH NO DATA
-```
-
-The migrator does not copy existing table rows. Any required data backfill must be handled separately.
-
-### Materialized views
-
-An existing materialized view's populated/unpopulated state is preserved. An unpopulated materialized view is recreated with `WITH NO DATA`.
-
----
-
-# 6. Application-level rehearsal validation
-
-The migrator validates database structure and dependency relationships. It cannot see every dependency outside PostgreSQL.
-
-Check relevant:
-
-- application queries;
-- reports/screens;
-- ETL jobs;
-- scheduled workflows;
-- external consumers;
-- data-population processes.
-
----
-
-# 7. Prepare the real target
-
-Point `.env` at the real target database and verify it again:
-
-```powershell
-Get-Content .env
-```
-
-**Double-check `PGDATABASE`, host, port, and user.**
-
-Do not assume the target catalog is identical to the rehearsal catalog.
-
----
-
-# 8. Discover and plan again on the target
-
-Run discovery again:
-
-```powershell
-python -m migrator discover loans_sch_info
-```
-
-Then generate a **fresh** target plan:
-
-```powershell
-python -m migrator plan-family loans_sch_info t_loans_sch_info.sql v_loans_sch_info.sql mv_loans_sch_info.sql
-```
-
-Review the target plan from scratch.
 
 Confirm:
 
-- family objects;
-- schemas;
-- actual PostgreSQL object types;
-- `NEW SQL` / `EXISTING SQL` classification;
-- dependency drop order;
-- dependency create order;
-- indexes;
-- metadata.
+* Target schema
+* Target object
+* Object type
+* OID
+* Dependency tree
 
-Do not reuse the rehearsal plan as a substitute for a target plan.
-
----
-
-# 9. Apply the target migration
-
-Only after the target plan is approved:
-
-```powershell
-python -m migrator apply-family loans_sch_info t_loans_sch_info.sql v_loans_sch_info.sql mv_loans_sch_info.sql
-```
-
-Wait for:
+Example:
 
 ```text
-FAMILY MIGRATION APPLIED SUCCESSFULLY
-VERIFICATION PASSED
+TARGET: auto_views.v_collection_base [VIEW]
+OID: 82159
+
+DEPENDENCY TREE:
+auto_views.v_collection_base [VIEW]
+└── public.mv_collection_base [VIEW]
+    ├── auto_views.v_collection_segmentation_v0 [VIEW]
+    └── auto_views.v_consumer_delinquency [VIEW]
 ```
 
-If the result is unexpected, stop.
+The dependency tree is migration-aware.
+
+For managed families, the tool can include the logical family relationship:
+
+```text
+v_collection_base
+        │
+        ▼
+mv_collection_base
+```
+
+even when PostgreSQL's ordinary dependency metadata does not express that relationship in the same way.
 
 ---
 
-# 10. Post-migration checks
+# 7. Step 2 — Analyze
 
-Run the automated suite:
+Run:
+
+```powershell
+python -m migrator analyze change.sql
+```
+
+Review:
+
+* Migration target
+* Migration mode
+* Family name, if applicable
+* Object type
+* Proposed column changes
+* Impacted objects
+* Validation results
+* Dependency relationships
+
+Do not continue if the analysis contains an unexpected object or unsupported change.
+
+---
+
+# 8. Step 3 — Generate the Plan
+
+Run:
+
+```powershell
+python -m migrator plan change.sql
+```
+
+The plan is the primary artifact to review before execution.
+
+Check:
+
+### Target
+
+Is the correct schema/object being changed?
+
+### Root changes
+
+Are the expected columns being added or removed?
+
+### Impacted objects
+
+Are all affected views/materialized views expected?
+
+### Drop order
+
+Dependents should be dropped before objects they depend on.
+
+### Create order
+
+Referenced objects should be recreated before dependent objects.
+
+### SQL
+
+Confirm that the generated SQL matches the intended migration.
+
+---
+
+# 9. Step 4 — Review
+
+A human should review the plan before applying it to production.
+
+Confirm:
+
+* Correct database
+* Correct schema
+* Correct root object
+* Expected columns
+* Expected dependencies
+* No unexpected destructive changes
+* No unexpected objects
+* No unsupported changes
+* Correct explicit view definitions
+* Correct family propagation
+
+If anything is unexpected:
+
+**Stop. Do not run `apply`.**
+
+Investigate the plan first.
+
+---
+
+# 10. Step 5 — Backup / Snapshot
+
+For production migrations, ensure the appropriate database recovery mechanism exists before applying the change.
+
+Depending on the environment, this may be:
+
+* Database backup
+* Snapshot
+* Point-in-time recovery
+* Replica
+* Existing disaster-recovery procedure
+
+The migration itself is transactional, but a transaction is not a replacement for a production backup strategy.
+
+---
+
+# 11. Step 6 — Apply
+
+After review:
+
+```powershell
+python -m migrator apply change.sql
+```
+
+Example:
+
+```powershell
+python -m migrator apply v_collection_base_changed.sql
+```
+
+The migration runs inside a transaction.
+
+The expected successful result is:
+
+```text
+MIGRATION APPLIED SUCCESSFULLY
+MIGRATION VERIFIED
+```
+
+---
+
+# 12. Transaction and Rollback Behavior
+
+The migration is designed so that failure does not leave a partially applied dependency migration committed.
+
+If an operation fails:
+
+```text
+DROP
+ALTER
+CREATE
+VERIFY
+```
+
+the migration is rolled back.
+
+This is particularly important when recreating multiple dependent views.
+
+Do not manually execute individual DROP statements from the generated plan unless you deliberately understand the consequences.
+
+---
+
+# 13. Physical Table Migrations
+
+Physical tables are handled differently from views.
+
+Currently supported:
+
+```text
+ADD COLUMN
+DROP COLUMN
+```
+
+Example:
+
+```sql
+ALTER TABLE offloading.securitizations
+DROP COLUMN migration_test_2;
+```
+
+The tool does not automatically support:
+
+```text
+TYPE CHANGE
+NULLABILITY CHANGE
+```
+
+For example, a proposed change from:
+
+```text
+varchar
+```
+
+to:
+
+```text
+uuid
+```
+
+is rejected rather than automatically transformed.
+
+This is intentional.
+
+---
+
+# 14. Managed Family Migrations
+
+A managed family may contain:
+
+```text
+v_<family>
+t_<family>
+mv_<family>
+```
+
+For example:
+
+```text
+auto_views.v_collection_base
+auto_views.t_collection_base
+public.mv_collection_base
+```
+
+The physical table is considered externally owned.
+
+The family migration executor does not drop or recreate:
+
+```text
+t_<family>
+```
+
+---
+
+# 15. Source View Migration
+
+When:
+
+```text
+v_<family>.sql
+```
+
+is supplied, its SQL is authoritative.
+
+If:
+
+```text
+mv_<family>
+```
+
+is not explicitly supplied, the tool may generate its definition from the same SELECT body.
+
+Example:
+
+```text
+v_collection_base.sql
+```
+
+can result in:
+
+```text
+auto_views.v_collection_base
+        │
+        ▼
+public.mv_collection_base
+```
+
+being recreated from the same proposed definition.
+
+---
+
+# 16. Explicit Published View SQL
+
+If:
+
+```text
+mv_<family>.sql
+```
+
+is supplied explicitly, that definition wins.
+
+For example:
+
+```text
+v_collection_base.sql
+mv_collection_base.sql
+```
+
+means the published-view SQL is taken from:
+
+```text
+mv_collection_base.sql
+```
+
+It is not overwritten by automatic generation from `v_collection_base.sql`.
+
+This rule is important for production safety.
+
+---
+
+# 17. Automatic Family Propagation
+
+When:
+
+```text
+t_<family>.sql
+```
+
+changes the proposed table schema, the tool can propagate compatible column changes to family views.
+
+Automatic propagation is only allowed for simple projection views.
+
+Safe example:
+
+```sql
+SELECT
+    customer_id,
+    loan_id,
+    status
+FROM auto_views.t_loans_info;
+```
+
+Unsafe examples include:
+
+```sql
+SELECT CASE ...
+```
+
+```sql
+SELECT ...
+FROM a
+JOIN b ...
+```
+
+```sql
+SELECT ...
+FROM table
+WHERE ...
+```
+
+```sql
+SELECT DISTINCT ...
+```
+
+```sql
+SELECT SUM(...) ...
+GROUP BY ...
+```
+
+When automatic propagation is unsafe, the migration must provide explicit view SQL.
+
+The tool should reject the migration instead of guessing.
+
+---
+
+# 18. Dependency Ordering
+
+The migration engine maintains dependency-safe ordering.
+
+For example:
+
+```text
+v_collection_base
+        │
+        ▼
+mv_collection_base
+        │
+        ▼
+v_consumer_delinquency
+```
+
+The drop sequence must be approximately:
+
+```text
+v_consumer_delinquency
+mv_collection_base
+v_collection_base
+```
+
+The create sequence must be approximately:
+
+```text
+v_collection_base
+mv_collection_base
+v_consumer_delinquency
+```
+
+The exact order is calculated from the dependency graph.
+
+---
+
+# 19. Verification
+
+After `apply`, confirm:
+
+* The migration reports success.
+* Verification succeeds.
+* The root object's definition matches the intended definition.
+* Expected columns exist.
+* Removed columns no longer exist.
+* Dependent views exist.
+* Dependent views are valid.
+* Materialized views have the expected state.
+* Application queries still work.
+
+For important production migrations, perform application-level smoke tests as well.
+
+---
+
+# 20. Managed Family Example
+
+Suppose the current family is:
+
+```text
+auto_views.v_collection_base
+auto_views.t_collection_base
+public.mv_collection_base
+```
+
+A source-view change is supplied:
+
+```powershell
+python -m migrator discover v_collection_base_changed.sql
+```
+
+Then:
+
+```powershell
+python -m migrator analyze v_collection_base_changed.sql
+```
+
+Then:
+
+```powershell
+python -m migrator plan v_collection_base_changed.sql
+```
+
+Review the plan.
+
+Finally:
+
+```powershell
+python -m migrator apply v_collection_base_changed.sql
+```
+
+Expected result:
+
+```text
+MIGRATION APPLIED SUCCESSFULLY
+MIGRATION VERIFIED
+```
+
+---
+
+# 21. Arbitrary Table Example
+
+For an unmanaged physical table:
+
+```text
+offloading.securitizations
+```
+
+the SQL may propose:
+
+```sql
+CREATE TABLE offloading.securitizations (
+    securitization_id int4 NOT NULL,
+    loan_id uuid NOT NULL,
+    batch_id varchar(8000) NOT NULL,
+    state varchar(8000) NOT NULL,
+    created_at timestamp(6) NOT NULL,
+    updated_at timestamp(6) NOT NULL,
+    CONSTRAINT securitizations_pkey PRIMARY KEY (securitization_id),
+    migration_test varchar
+);
+```
+
+If the only difference from the live table is an added column, the planner generates an `ALTER TABLE ... ADD COLUMN`.
+
+If a column is removed, the planner can generate:
+
+```sql
+ALTER TABLE ...
+DROP COLUMN ...
+```
+
+The table itself is never dropped and recreated.
+
+---
+
+# 22. Troubleshooting
+
+## `ModuleNotFoundError: No module named 'migrator'`
+
+Use:
 
 ```powershell
 python -m pytest -q
 ```
 
-Then perform application-level checks for the affected objects.
+instead of:
 
-Confirm the intended schema change and downstream behavior before declaring the migration complete.
+```powershell
+pytest -q
+```
+
+Also verify:
+
+```powershell
+python -c "import migrator; print(migrator.__file__)"
+```
 
 ---
 
-# Troubleshooting
+## Published schema is wrong
 
-## Duplicate column
+Managed families can have a published view in a different schema.
 
-For:
-
-```text
-psycopg.errors.DuplicateColumn
-```
-
-inspect the proposed SQL and ensure output column names are unique.
-
-For example, do not define the same output name twice:
-
-```sql
-migration_test_marker,
-'migration_test_marker' AS migration_test_marker
-```
-
-## Ambiguous family
-
-For:
+For example:
 
 ```text
-Managed object family is ambiguous
+Source:
+auto_views.v_collection_base
+
+Published:
+public.mv_collection_base
 ```
 
-stop and inspect the discovered schemas/objects. Do not guess.
+The family catalog must contain the correct published schema.
 
-If multiple published views exist, use a schema-qualified published-view SQL definition to identify the intended schema.
-
-## Verification failure
-
-Stop. Do not immediately retry.
-
-Inspect:
-
-- migration SQL;
-- generated plan;
-- resulting object definitions;
-- reported verification error;
-- target database configuration.
-
-Execution errors are rolled back by the migration transaction, but verification failure still requires investigation.
+Do not assume the `mv_` object is in the same schema as the source view.
 
 ---
 
-# Success criteria
+## Migration says a family is ambiguous
 
-A migration is complete only when:
+The managed-family catalog must resolve exactly one family matching the requested name.
 
-- the correct target database was confirmed;
-- the target family was discovered correctly;
-- the target plan was reviewed;
-- intended family objects received `NEW SQL`;
-- unchanged downstream objects retained `EXISTING SQL`;
-- object types are correct;
-- drop/create ordering is correct;
-- execution completed without SQL errors;
-- `FAMILY MIGRATION APPLIED SUCCESSFULLY` was reported;
-- `VERIFICATION PASSED` was reported;
-- automated tests passed as applicable;
-- application-level validation passed.
+Check for duplicate family members.
 
-# Emergency principle
+---
 
-If the target is wrong, the family is ambiguous, the plan is unexpected, the SQL is unexpected, or verification fails:
+## Automatic propagation is rejected
 
-**STOP — investigate before continuing.**
+If the tool reports that automatic family propagation is unsafe, provide explicit:
+
+```text
+v_<family>.sql
+```
+
+or:
+
+```text
+mv_<family>.sql
+```
+
+definitions.
+
+Do not simplify or bypass the safety check merely to make the migration run.
+
+---
+
+## Plan contains unexpected dependent objects
+
+Stop before applying.
+
+Run:
+
+```powershell
+python -m migrator discover change.sql
+```
+
+and inspect the dependency tree.
+
+Then:
+
+```powershell
+python -m migrator analyze change.sql
+```
+
+Determine why the object is being included.
+
+Unexpected dependency impact should be investigated before production execution.
+
+---
+
+# 23. Production Checklist
+
+Before:
+
+* [ ] Correct database selected
+* [ ] Correct SQL file selected
+* [ ] Database backup/snapshot available
+* [ ] Tests passing
+* [ ] `discover` reviewed
+* [ ] `analyze` reviewed
+* [ ] `plan` reviewed
+* [ ] Expected root object confirmed
+* [ ] Expected dependencies confirmed
+* [ ] Unsupported changes ruled out
+* [ ] Explicit SQL reviewed
+* [ ] Application impact understood
+
+During:
+
+* [ ] Run `apply`
+* [ ] Watch for errors
+* [ ] Confirm transaction completes
+* [ ] Confirm verification succeeds
+
+After:
+
+* [ ] Confirm `MIGRATION APPLIED SUCCESSFULLY`
+* [ ] Confirm `MIGRATION VERIFIED`
+* [ ] Verify root object
+* [ ] Verify dependent objects
+* [ ] Run application smoke tests
+* [ ] Monitor for query/application errors
+
+---
+
+# 24. Standard Production Command Sequence
+
+Use:
+
+```powershell
+python -m migrator discover change.sql
+python -m migrator analyze change.sql
+python -m migrator plan change.sql
+```
+
+After review:
+
+```powershell
+python -m migrator apply change.sql
+```
+
+For a managed family:
+
+```powershell
+python -m migrator plan-family collection_base v_collection_base_changed.sql
+```
+
+Then:
+
+```powershell
+python -m migrator apply-family collection_base v_collection_base_changed.sql
+```
+
+---
+
+# 25. Operational Principle
+
+The most important rule is:
+
+> Never apply a migration you have not reviewed.
+
+The tool is designed to make migration planning safer and more deterministic, but the final decision remains with the operator.
+
+A successful migration is not just:
+
+```text
+SQL executed
+```
+
+It is:
+
+```text
+Correct target
+    +
+Correct dependency analysis
+    +
+Correct migration plan
+    +
+Successful transaction
+    +
+Successful verification
+    +
+Application validation
+```
+
+That is the expected production workflow.

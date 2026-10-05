@@ -1,5 +1,19 @@
-from .models import Column, DatabaseObject, MigrationPlan
+from .models import (
+    Column,
+    DatabaseObject,
+    MigrationPlan,
+    SchemaComparison,
+)
 from .sql_utils import quote_identifier, qualified_name
+
+
+def _is_physical_table(
+    obj: DatabaseObject,
+) -> bool:
+    return obj.object_type in {
+        "TABLE",
+        "PARTITIONED TABLE",
+    }
 
 
 def generate_drop_sql(
@@ -14,17 +28,17 @@ def generate_drop_sql(
 
         obj = objects[oid]
 
+        # Physical tables are managed externally and must never be
+        # dropped or recreated by the migration tool.
+        if _is_physical_table(obj):
+            continue
+
         object_name = qualified_name(
             obj.schema,
             obj.name,
         )
 
-        if obj.object_type == "TABLE":
-            statements.append(
-                f"DROP TABLE {object_name};"
-            )
-
-        elif obj.object_type == "VIEW":
+        if obj.object_type == "VIEW":
             statements.append(
                 f"DROP VIEW {object_name};"
             )
@@ -132,7 +146,15 @@ def generate_create_sql(
     statements = []
 
     for oid in create_order:
+        if oid not in objects:
+            continue
+
         obj = objects[oid]
+
+        # Physical tables are managed externally and must never be
+        # created or otherwise modified by the migration tool.
+        if _is_physical_table(obj):
+            continue
 
         definition = obj.definition
         columns = None
@@ -146,7 +168,7 @@ def generate_create_sql(
 
             columns = proposed_columns
 
-        if obj.object_type != "TABLE" and not definition:
+        if not definition:
             object_name = qualified_name(
                 obj.schema,
                 obj.name,
@@ -189,6 +211,98 @@ def generate_create_sql(
     return "\n".join(statements)
 
 
+def generate_table_alter_sql(
+    obj: DatabaseObject,
+    comparison: SchemaComparison,
+) -> str:
+    """
+    Generate in-place ALTER TABLE statements for physical tables.
+
+    Supported:
+      - ADD COLUMN
+      - DROP COLUMN
+
+    Not currently supported:
+      - changing an existing column's data type
+      - changing an existing column's nullability
+
+    DROP COLUMN intentionally does NOT use CASCADE.
+
+    The migration executor drops known dependent views/materialized
+    views explicitly before this function runs, then recreates them
+    afterward. This keeps dependency management under the control of
+    the migration planner instead of PostgreSQL's implicit CASCADE
+    behavior.
+    """
+
+    if obj.object_type not in {
+        "TABLE",
+        "PARTITIONED TABLE",
+    }:
+        return ""
+
+    statements = []
+
+    object_name = qualified_name(
+        obj.schema,
+        obj.name,
+    )
+
+    # --------------------------------------------------------------
+    # DROP COLUMNS
+    #
+    # Dependencies have already been dropped by the executor.
+    # Therefore DROP COLUMN can safely run without CASCADE.
+    # --------------------------------------------------------------
+    for change in comparison.removed:
+        statements.append(
+            f"ALTER TABLE {object_name}\n"
+            f"DROP COLUMN {quote_identifier(change.column_name)};"
+        )
+
+    # --------------------------------------------------------------
+    # ADD COLUMNS
+    # --------------------------------------------------------------
+    for change in comparison.added:
+        column = change.new_column
+
+        if column is None:
+            continue
+
+        if not column.nullable:
+            raise ValueError(
+                "Cannot automatically add a NOT NULL column without "
+                "a default value to a physical table: "
+                f"{obj.schema}.{obj.name}.{column.name}"
+            )
+
+        statements.append(
+            f"ALTER TABLE {object_name}\n"
+            f"ADD COLUMN {quote_identifier(column.name)} "
+            f"{column.data_type};"
+        )
+
+    # --------------------------------------------------------------
+    # TYPE / NULLABILITY CHANGES
+    #
+    # These remain intentionally unsupported because they require
+    # explicit conversion/default semantics.
+    # --------------------------------------------------------------
+    if comparison.changed:
+        changed = ", ".join(
+            change.column_name
+            for change in comparison.changed
+        )
+
+        raise ValueError(
+            "Automatic column type/nullability changes are not "
+            "supported yet for "
+            f"{object_name}: {changed}"
+        )
+
+    return "\n".join(statements)
+
+
 def generate_migration_sql(
     drop_order: list[int],
     create_order: list[int],
@@ -196,11 +310,27 @@ def generate_migration_sql(
     root_oid: int | None = None,
     proposed_definition: str | None = None,
     proposed_columns: list[Column] | None = None,
+    comparison: SchemaComparison | None = None,
 ) -> str:
     drop_sql = generate_drop_sql(
         drop_order,
         objects,
     )
+
+    alter_sql = ""
+
+    if (
+        root_oid is not None
+        and comparison is not None
+        and root_oid in objects
+    ):
+        root_object = objects[root_oid]
+
+        if _is_physical_table(root_object):
+            alter_sql = generate_table_alter_sql(
+                root_object,
+                comparison,
+            )
 
     create_sql = generate_create_sql(
         create_order,
@@ -216,6 +346,12 @@ def generate_migration_sql(
         sections.append(
             "-- DROP OBJECTS\n"
             + drop_sql
+        )
+
+    if alter_sql:
+        sections.append(
+            "-- ALTER TABLES\n"
+            + alter_sql
         )
 
     if create_sql:
@@ -243,6 +379,11 @@ def generate_family_create_sql(
 
         obj = objects[oid]
 
+        # Physical tables are managed externally and must never be
+        # created or otherwise modified by the migration tool.
+        if _is_physical_table(obj):
+            continue
+
         definition = proposed_definitions.get(
             oid,
             obj.definition,
@@ -250,7 +391,7 @@ def generate_family_create_sql(
 
         columns = proposed_columns.get(oid)
 
-        if obj.object_type != "TABLE" and not definition:
+        if not definition:
             object_name = qualified_name(
                 obj.schema,
                 obj.name,

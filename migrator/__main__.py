@@ -1,38 +1,30 @@
+import os
 import sys
 
-from .catalog import discover_families
+from .executor import verify_migration
+from .analysis import analyze_migration
+from .catalog import (
+    discover_families,
+    get_managed_family,
+)
 from .db import Database
+from .executor import execute_migration
 from .migration import (
+    build_cli_migration_plan,
     build_family_migration_plan,
     build_migration_plan,
 )
-from .proposed import parse_proposed_objects
+from .planner import build_dependencies
+from .proposed import (
+    parse_proposed_object,
+    parse_proposed_objects,
+)
 from .snapshot import get_object
 from .sql_generator import (
     generate_family_migration_sql,
     generate_migration_sql,
 )
-
-
-def print_usage():
-    print(
-        """
-Usage:
-
-  python -m migrator discover
-  python -m migrator discover <family_name>
-
-  python -m migrator analyze <root> <sql_file>
-
-  python -m migrator plan <root> <sql_file>
-
-  python -m migrator apply <root> <sql_file>
-
-  python -m migrator plan-family <family_name> <sql_file> [<sql_file> ...]
-
-  python -m migrator apply-family <family_name> <sql_file> [<sql_file> ...]
-"""
-    )
+from .sql_utils import qualified_name
 
 
 def read_sql_files(paths):
@@ -142,6 +134,61 @@ def print_dependency_tree(
         )
 
 
+def discover_sql_file(
+    db,
+    sql_file,
+):
+    sql = read_sql_files(
+        [sql_file]
+    )[0]
+
+    migration_plan = build_cli_migration_plan(
+        db,
+        sql,
+    )
+
+    root_oid = migration_plan.root_oid
+    root_obj = migration_plan.objects[root_oid]
+
+    print(
+        f"TARGET: {root_obj.schema}.{root_obj.name} "
+        f"[{root_obj.object_type}]"
+    )
+
+    print(
+        f"OID: {root_obj.oid}"
+    )
+
+    print()
+
+    print("DEPENDENCY TREE:")
+
+    print_dependency_tree(
+        db,
+        root_oid,
+        migration_plan.dependencies,
+    )
+
+
+def print_usage():
+    print(
+        """
+Usage:
+
+  python -m migrator discover <sql_file>
+
+  python -m migrator analyze <sql_file>
+  python -m migrator plan <sql_file>
+
+  python -m migrator apply <sql_file>
+
+  python -m migrator plan-family <family_name> <sql_file> [<sql_file> ...]
+
+  python -m migrator apply-family <family_name> <sql_file> [<sql_file> ...]
+"""
+    )
+
+
 def discover(
     db,
     family_name=None,
@@ -190,37 +237,33 @@ def discover(
 
 def analyze(
     db,
-    root,
     sql_file,
 ):
     sql = read_sql_files(
         [sql_file]
     )[0]
 
-    plan = build_migration_plan(
+    analysis = analyze_migration(
         db,
-        root,
         sql,
     )
 
+    migration_plan = analysis["plan"]
+
     print(
-        f"ROOT: {plan.root_name}"
+        f"ROOT: {analysis['root_name']}"
     )
 
     print(
         f"BREAKING: "
-        f"{plan.comparison.is_breaking}"
+        f"{analysis['breaking']}"
     )
 
     print()
 
     print("COLUMN CHANGES:")
 
-    for change in (
-        plan.comparison.added
-        + plan.comparison.removed
-        + plan.comparison.changed
-    ):
+    for change in analysis["column_changes"]:
         print(
             f"  {change.change_type}: "
             f"{change.column_name}"
@@ -230,7 +273,7 @@ def analyze(
 
     print("IMPACTED OBJECTS:")
 
-    for obj in plan.impacted_objects:
+    for obj in analysis["impacted_objects"]:
         print(
             f"  {obj.object_name} "
             f"[{obj.object_type}]"
@@ -242,31 +285,171 @@ def analyze(
 
     print_dependency_tree(
         db,
-        plan.root_oid,
-        plan.dependencies,
+        migration_plan.root_oid,
+        migration_plan.dependencies,
     )
 
 
 def plan(
     db,
-    root,
     sql_file,
 ):
+    from .sql_generator import generate_table_alter_sql
+
     sql = read_sql_files(
         [sql_file]
     )[0]
 
-    migration_plan = build_migration_plan(
+    migration_plan = build_cli_migration_plan(
         db,
-        root,
         sql,
     )
 
+    root = migration_plan.root_name
+
     print(
-        generate_migration_sql(
-            migration_plan
+        f"MIGRATION TARGET: {root}"
+    )
+
+    if migration_plan.is_family:
+
+        family_name = root.rsplit(".", 1)[-1]
+
+        if family_name.startswith("v_"):
+
+            family_name = family_name[2:]
+    
+        elif family_name.startswith("t_"):
+
+            family_name = family_name[2:]
+
+        elif family_name.startswith("mv_"):
+     
+            family_name = family_name[3:]
+
+        print("MIGRATION MODE: MANAGED FAMILY")
+        print(f"FAMILY: {family_name}")
+
+    target = migration_plan.objects.get(
+        migration_plan.root_oid
+    )
+
+    if target is not None:
+        print(
+            f"OBJECT TYPE: {target.object_type}"
+        )
+
+    print()
+
+    proposed_definition = (
+        migration_plan.proposed_definitions.get(
+            migration_plan.root_oid
         )
     )
+
+    proposed_columns = (
+        migration_plan.proposed_columns.get(
+            migration_plan.root_oid
+        )
+    )
+
+    # --------------------------------------------------------------
+    # Managed-family plan
+    # --------------------------------------------------------------
+
+    if migration_plan.is_family:
+        migration_sql = generate_family_migration_sql(
+            migration_plan
+        )
+
+        print(
+            migration_sql
+        )
+        return
+
+    # --------------------------------------------------------------
+    # Generic migration
+    #
+    # Print each phase explicitly so the displayed plan exactly
+    # matches the operations that will be performed.
+    # --------------------------------------------------------------
+
+    print("-- DROP OBJECTS")
+
+    drop_sql = generate_migration_sql(
+        migration_plan.drop_order,
+        [],
+        migration_plan.objects,
+        root_oid=migration_plan.root_oid,
+        proposed_definition=proposed_definition,
+        proposed_columns=proposed_columns,
+        comparison=migration_plan.comparison,
+    )
+
+    # generate_migration_sql() may contain the drop statements.
+    # We only want the DROP phase here, so generate it directly.
+    from .sql_generator import generate_drop_sql
+
+    drop_sql = generate_drop_sql(
+        migration_plan.drop_order,
+        migration_plan.objects,
+    )
+
+    if drop_sql.strip():
+        print(drop_sql)
+
+    print()
+
+    # --------------------------------------------------------------
+    # ALTER ROOT
+    # --------------------------------------------------------------
+
+    print("-- ALTER ROOT")
+
+    alter_sql = ""
+
+    if target is not None and target.object_type in {
+        "TABLE",
+        "PARTITIONED TABLE",
+    }:
+        alter_sql = generate_table_alter_sql(
+            target,
+            migration_plan.comparison,
+        )
+
+    if alter_sql.strip():
+        print(alter_sql)
+    else:
+        print("-- No root table changes")
+
+    print()
+
+    # --------------------------------------------------------------
+    # CREATE OBJECTS
+    # --------------------------------------------------------------
+
+    print("-- CREATE OBJECTS")
+
+    create_sql = generate_migration_sql(
+        [],
+        migration_plan.create_order,
+        migration_plan.objects,
+        root_oid=migration_plan.root_oid,
+        proposed_definition=proposed_definition,
+        proposed_columns=proposed_columns,
+        comparison=None,
+    )
+
+    create_sql = create_sql.replace(
+        "-- CREATE OBJECTS\n",
+        "",
+        1,
+    )
+
+    if create_sql.strip():
+        print(create_sql)
+    else:
+        print("-- No objects to create")
 
 
 def plan_family(
@@ -357,29 +540,40 @@ def plan_family(
 
 def apply(
     db,
-    root,
     sql_file,
 ):
-    from .executor import execute_migration
-
     sql = read_sql_files(
         [sql_file]
     )[0]
 
-    migration_plan = build_migration_plan(
+    migration_plan = build_cli_migration_plan(
         db,
-        root,
         sql,
     )
+
+    print(
+        f"MIGRATION TARGET: "
+        f"{migration_plan.root_name}"
+    )
+
+    target = migration_plan.objects.get(
+        migration_plan.root_oid
+    )
+
+    if target is not None:
+        print(
+            f"OBJECT TYPE: "
+            f"{target.object_type}"
+        )
+
+    print()
 
     if not migration_plan.validation.is_valid:
         print(
             "MIGRATION BLOCKED"
         )
 
-        for issue in (
-            migration_plan.validation.issues
-        ):
+        for issue in migration_plan.validation.issues:
             print(
                 f"{issue.object_name}: "
                 f"{issue.column_name} "
@@ -388,21 +582,67 @@ def apply(
 
         return
 
-    migration_sql = generate_migration_sql(
-        migration_plan
+    proposed_definition = (
+        migration_plan.proposed_definitions.get(
+            migration_plan.root_oid
+        )
     )
+
+    proposed_columns = (
+        migration_plan.proposed_columns.get(
+            migration_plan.root_oid
+        )
+    )
+
+    # --------------------------------------------------------------
+    # Managed-family plan:
+    # multiple proposed definitions require family SQL generation.
+    #
+    # Generic plan:
+    # use the generic generator so arbitrary TABLE roots can emit
+    # safe ALTER TABLE statements.
+    # --------------------------------------------------------------
+
+    if migration_plan.is_family:
+        migration_sql = generate_family_migration_sql(
+            migration_plan
+        )
+    else:
+        migration_sql = generate_migration_sql(
+            migration_plan.drop_order,
+            migration_plan.create_order,
+            migration_plan.objects,
+            root_oid=migration_plan.root_oid,
+            proposed_definition=proposed_definition,
+            proposed_columns=proposed_columns,
+            comparison=migration_plan.comparison,
+        )
 
     print(
         migration_sql
     )
 
     execute_migration(
+    db,
+    migration_plan,
+    migration_plan.objects,
+)
+
+
+
+    verify_migration(
         db,
         migration_plan,
     )
 
+    db.connection.commit()
+
     print(
         "MIGRATION APPLIED SUCCESSFULLY"
+    )
+
+    print(
+        "MIGRATION VERIFIED"
     )
 
 
@@ -470,49 +710,51 @@ def main():
 
     try:
         if command == "discover":
-            if len(args) == 1:
-                discover(db)
+            if len(args) != 2:
+                print_usage()
+                return
 
-            elif len(args) == 2:
+            target = args[1]
+
+            if os.path.isfile(target):
+                discover_sql_file(
+                    db,
+                    target,
+                )
+            else:
                 discover(
                     db,
-                    family_name=args[1],
+                    family_name=target,
                 )
 
-            else:
-                print_usage()
-
         elif command == "analyze":
-            if len(args) != 3:
+            if len(args) != 2:
                 print_usage()
                 return
 
             analyze(
                 db,
                 args[1],
-                args[2],
             )
 
         elif command == "plan":
-            if len(args) != 3:
+            if len(args) != 2:
                 print_usage()
                 return
 
             plan(
                 db,
                 args[1],
-                args[2],
             )
 
         elif command == "apply":
-            if len(args) != 3:
+            if len(args) != 2:
                 print_usage()
                 return
 
             apply(
                 db,
                 args[1],
-                args[2],
             )
 
         elif command == "plan-family":

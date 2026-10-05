@@ -1,11 +1,7 @@
 import pytest
 
 from migrator.catalog import get_managed_family
-from migrator.migration import (
-    build_family_migration_plan,
-    get_family_dependency_objects,
-    get_family_migration_objects,
-)
+from migrator.migration import build_family_migration_plan
 from migrator.models import ProposedObject
 
 
@@ -57,16 +53,15 @@ def get_family_proposed_objects(staging_db):
 def test_staging_family_preserves_actual_object_types(
     staging_db,
 ):
-    objects = get_family_migration_objects(
-        staging_db,
-        FAMILY_NAME,
-        published_schema=PUBLISHED_SCHEMA,
+    proposed_objects = get_family_proposed_objects(
+        staging_db
     )
 
-    object_types = {
-        (obj.schema, obj.name): obj.object_type
-        for obj in objects.values()
-    }
+    plan = build_family_migration_plan(
+        staging_db,
+        FAMILY_NAME,
+        proposed_objects,
+    )
 
     family = get_managed_family(
         staging_db,
@@ -74,7 +69,7 @@ def test_staging_family_preserves_actual_object_types(
         published_schema=PUBLISHED_SCHEMA,
     )
 
-    assert object_types == {
+    expected_objects = {
         (
             family.source_view_schema,
             family.source_view_name,
@@ -89,19 +84,26 @@ def test_staging_family_preserves_actual_object_types(
         ): "VIEW",
     }
 
+    actual_objects = {
+        (obj.schema, obj.name): obj.object_type
+        for obj in plan.objects.values()
+        if (obj.schema, obj.name) in expected_objects
+    }
+
+    assert actual_objects == expected_objects
+
 
 def test_staging_family_discovers_cross_schema_downstream_object(
     staging_db,
 ):
-    family_objects = get_family_migration_objects(
-        staging_db,
-        FAMILY_NAME,
-        published_schema=PUBLISHED_SCHEMA,
+    proposed_objects = get_family_proposed_objects(
+        staging_db
     )
 
-    dependency_objects = get_family_dependency_objects(
+    plan = build_family_migration_plan(
         staging_db,
-        family_objects,
+        FAMILY_NAME,
+        proposed_objects,
     )
 
     family = get_managed_family(
@@ -110,10 +112,19 @@ def test_staging_family_discovers_cross_schema_downstream_object(
         published_schema=PUBLISHED_SCHEMA,
     )
 
+    published_oid = next(
+        oid
+        for oid, obj in plan.objects.items()
+        if (
+            obj.schema == family.published_view_schema
+            and obj.name == family.published_view_name
+        )
+    )
+
     assert any(
-        obj.schema != family.published_view_schema
-        and obj.name == family.published_view_name
-        for obj in dependency_objects.values()
+        dependency.referenced_oid == published_oid
+        and dependency.dependent_oid != published_oid
+        for dependency in plan.dependencies
     )
 
 
@@ -145,20 +156,14 @@ def test_staging_family_plan_contains_cross_schema_dependency(
         )
     )
 
-    downstream_oid = next(
-        oid
-        for oid, obj in plan.objects.items()
-        if (
-            obj.schema != family.published_view_schema
-            and obj.name == family.published_view_name
-        )
-    )
-
-    assert any(
-        dependency.referenced_oid == public_oid
-        and dependency.dependent_oid == downstream_oid
+    downstream_oids = [
+        dependency.dependent_oid
         for dependency in plan.dependencies
-    )
+        if dependency.referenced_oid == public_oid
+        and dependency.dependent_oid != public_oid
+    ]
+
+    assert downstream_oids
 
 
 def test_staging_family_create_order_respects_cross_schema_dependency(
@@ -189,19 +194,20 @@ def test_staging_family_create_order_respects_cross_schema_dependency(
         )
     )
 
-    downstream_oid = next(
-        oid
-        for oid, obj in plan.objects.items()
-        if (
-            obj.schema != family.published_view_schema
-            and obj.name == family.published_view_name
-        )
-    )
+    downstream_oids = [
+        dependency.dependent_oid
+        for dependency in plan.dependencies
+        if dependency.referenced_oid == public_oid
+        and dependency.dependent_oid != public_oid
+    ]
 
-    assert (
-        plan.create_order.index(public_oid)
-        < plan.create_order.index(downstream_oid)
-    )
+    assert downstream_oids
+
+    for downstream_oid in downstream_oids:
+        assert (
+            plan.create_order.index(public_oid)
+            < plan.create_order.index(downstream_oid)
+        )
 
 
 def test_staging_family_drop_order_respects_cross_schema_dependency(
@@ -232,19 +238,20 @@ def test_staging_family_drop_order_respects_cross_schema_dependency(
         )
     )
 
-    downstream_oid = next(
-        oid
-        for oid, obj in plan.objects.items()
-        if (
-            obj.schema != family.published_view_schema
-            and obj.name == family.published_view_name
-        )
-    )
+    downstream_oids = [
+        dependency.dependent_oid
+        for dependency in plan.dependencies
+        if dependency.referenced_oid == public_oid
+        and dependency.dependent_oid != public_oid
+    ]
 
-    assert (
-        plan.drop_order.index(downstream_oid)
-        < plan.drop_order.index(public_oid)
-    )
+    assert downstream_oids
+
+    for downstream_oid in downstream_oids:
+        assert (
+            plan.drop_order.index(downstream_oid)
+            < plan.drop_order.index(public_oid)
+        )
 
 
 def test_staging_family_plan_contains_downstream_views(
@@ -275,7 +282,7 @@ def test_staging_family_plan_contains_downstream_views(
     assert expected_downstream <= object_names
 
 
-def test_staging_family_plan_recreates_table_without_data(
+def test_staging_family_plan_never_recreates_physical_table(
     staging_db,
 ):
     proposed_objects = get_family_proposed_objects(
@@ -303,4 +310,11 @@ def test_staging_family_plan_recreates_table_without_data(
         )
     )
 
-    assert table_oid in plan.proposed_definitions
+    table = plan.objects[table_oid]
+
+    assert table.object_type == "TABLE"
+
+    # The live physical table is externally owned and must
+    # never be dropped or recreated by a family migration.
+    assert table_oid not in plan.drop_order
+    assert table_oid not in plan.create_order

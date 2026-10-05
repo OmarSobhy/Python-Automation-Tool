@@ -33,7 +33,7 @@ def build_dependencies(db, root):
         object_oids,
     )
 
-    return root_oid, dependencies
+    return root_oid, dependencies   
 
 def get_drop_order(
     root_oid: int,

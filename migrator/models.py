@@ -103,11 +103,16 @@ class MigrationPlan:
     root_oid: int
     root_name: str
     comparison: SchemaComparison
-    proposed_definitions: dict[int, str] = field(default_factory=dict)
+    is_family: bool = False
+    proposed_definitions: dict[int, str] = field(
+        default_factory=dict
+    )
     proposed_columns: dict[int, list[Column]] = field(
         default_factory=dict
     )
-    objects: dict[int, DatabaseObject] = field(default_factory=dict)
+    objects: dict[int, DatabaseObject] = field(
+        default_factory=dict
+    )
     impacted_objects: list[ImpactedObject] = field(
         default_factory=list
     )

@@ -1,15 +1,19 @@
+import pytest
 from migrator.models import (
     Column,
+    ColumnChange,
     DatabaseObject,
     MigrationPlan,
     SchemaComparison,
 )
+
 from migrator.sql_generator import (
     generate_create_sql,
     generate_family_create_sql,
     generate_family_migration_sql,
     generate_migration_sql,
     generate_object_create_sql,
+    generate_table_alter_sql,
 )
 
 
@@ -212,7 +216,7 @@ def test_generate_family_create_sql_uses_existing_definition_for_unchanged_objec
     assert "SELECT 1 AS id" in sql
 
 
-def test_generate_family_create_sql_fails_for_table_without_columns():
+def test_generate_family_create_sql_skips_physical_tables():
     obj = DatabaseObject(
         oid=789,
         schema="auto_views",
@@ -221,22 +225,13 @@ def test_generate_family_create_sql_fails_for_table_without_columns():
         definition=None,
     )
 
-    try:
-        generate_family_create_sql(
-            create_order=[789],
-            objects={789: obj},
-            proposed_definitions={},
-        )
-    except ValueError as exc:
-        assert (
-            str(exc)
-            == 'Table has no captured columns: '
-            '"auto_views"."t_downstream"'
-        )
-    else:
-        raise AssertionError(
-            "Expected ValueError for table without columns"
-        )
+    sql = generate_family_create_sql(
+        create_order=[789],
+        objects={789: obj},
+        proposed_definitions={},
+    )
+
+    assert sql == ""
 
 
 def test_generate_family_migration_sql():
@@ -326,3 +321,155 @@ def test_generate_family_migration_sql_has_sections():
     assert sql.startswith("-- DROP OBJECTS")
     assert "\n\n-- CREATE OBJECTS\n" in sql
     assert "SELECT 10" in sql
+
+
+def test_family_migration_never_generates_drop_table():
+    table = DatabaseObject(
+        oid=1,
+        schema="auto_views",
+        name="t_orders",
+        object_type="TABLE",
+        definition=None,
+    )
+
+    plan = MigrationPlan(
+        root_oid=1,
+        root_name="orders",
+        comparison=SchemaComparison(),
+        proposed_definitions={},
+        objects={1: table},
+        drop_order=[1],
+        create_order=[1],
+    )
+
+    sql = generate_family_migration_sql(plan)
+
+    assert "DROP TABLE" not in sql.upper()
+
+
+def test_family_migration_never_generates_create_table():
+    table = DatabaseObject(
+        oid=1,
+        schema="auto_views",
+        name="t_orders",
+        object_type="TABLE",
+        definition=None,
+    )
+
+    plan = MigrationPlan(
+        root_oid=1,
+        root_name="orders",
+        comparison=SchemaComparison(),
+        proposed_definitions={},
+        objects={1: table},
+        drop_order=[1],
+        create_order=[1],
+    )
+
+    sql = generate_family_migration_sql(plan)
+
+    assert "CREATE TABLE" not in sql.upper()
+
+
+def test_family_migration_never_generates_alter_table():
+    table = DatabaseObject(
+        oid=1,
+        schema="auto_views",
+        name="t_orders",
+        object_type="TABLE",
+        definition=None,
+    )
+
+    plan = MigrationPlan(
+        root_oid=1,
+        root_name="orders",
+        comparison=SchemaComparison(),
+        proposed_definitions={},
+        objects={1: table},
+        drop_order=[1],
+        create_order=[1],
+    )
+
+    sql = generate_family_migration_sql(plan)
+
+    assert "ALTER TABLE" not in sql.upper()
+
+
+def test_type_change_is_rejected():
+    obj = DatabaseObject(
+        oid=1,
+        schema="demo",
+        name="orders",
+        object_type="TABLE",
+    )
+
+    comparison = SchemaComparison(
+        changed=[
+            ColumnChange(
+                change_type="CHANGED",
+                column_name="amount",
+                old_column=Column(
+                    name="amount",
+                    data_type="integer",
+                    nullable=True,
+                    position=1,
+                ),
+                new_column=Column(
+                    name="amount",
+                    data_type="bigint",
+                    nullable=True,
+                    position=1,
+                ),
+                change_reason="TYPE_CHANGED",
+            )
+        ]
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="type/nullability",
+    ):
+        generate_table_alter_sql(
+            obj,
+            comparison,
+        )
+
+
+def test_nullability_change_is_rejected():
+    obj = DatabaseObject(
+        oid=1,
+        schema="demo",
+        name="orders",
+        object_type="TABLE",
+    )
+
+    comparison = SchemaComparison(
+        changed=[
+            ColumnChange(
+                change_type="CHANGED",
+                column_name="customer_name",
+                old_column=Column(
+                    name="customer_name",
+                    data_type="text",
+                    nullable=True,
+                    position=1,
+                ),
+                new_column=Column(
+                    name="customer_name",
+                    data_type="text",
+                    nullable=False,
+                    position=1,
+                ),
+                change_reason="NULLABILITY_CHANGED",
+            )
+        ]
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="type/nullability",
+    ):
+        generate_table_alter_sql(
+            obj,
+            comparison,
+        )

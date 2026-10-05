@@ -7,34 +7,6 @@ from .models import (
 )
 
 
-COLUMN_DEPENDENCY_SQL = """
-SELECT DISTINCT
-    dependent.oid AS dependent_oid,
-    dependent.oid::regclass::text AS dependent_object,
-    CASE dependent.relkind
-        WHEN 'v' THEN 'VIEW'
-        WHEN 'm' THEN 'MATERIALIZED VIEW'
-    END AS dependent_type,
-    referenced_attr.attname AS referenced_column
-FROM pg_depend d
-JOIN pg_rewrite rw
-    ON rw.oid = d.objid
-JOIN pg_class dependent
-    ON dependent.oid = rw.ev_class
-JOIN pg_class referenced
-    ON referenced.oid = d.refobjid
-JOIN pg_attribute referenced_attr
-    ON referenced_attr.attrelid = referenced.oid
-   AND referenced_attr.attnum = d.refobjsubid
-WHERE referenced.oid = %s::regclass
-  AND dependent.relkind IN ('v', 'm')
-  AND d.refobjsubid > 0
-ORDER BY
-    dependent_object,
-    referenced_column;
-"""
-
-
 def validate_migration(
     db: Database,
     root: str,
@@ -44,8 +16,19 @@ def validate_migration(
 ) -> MigrationValidation:
     validation = MigrationValidation()
 
+    # Keep rejecting schema changes that are explicitly classified as
+    # unsafe by change_safety.py.
+    #
+    # A removed column itself is not automatically unsafe here.
+    # Dependents will be dropped before the ALTER TABLE and recreated
+    # afterward inside the same transaction. If a dependent can no
+    # longer be recreated, PostgreSQL will raise an error and the
+    # migration will roll back.
     if changes:
         for change in changes:
+            if change.change_type == "REMOVED":
+                continue
+
             if not is_safe_change(change):
                 validation.issues.append(
                     ValidationIssue(
@@ -58,36 +41,5 @@ def validate_migration(
                         ),
                     )
                 )
-
-    rows = db.query(
-        COLUMN_DEPENDENCY_SQL,
-        (root,),
-    )
-
-    for (
-        dependent_oid,
-        dependent_object,
-        dependent_type,
-        referenced_column,
-    ) in rows:
-        if referenced_column in removed_columns:
-            validation.issues.append(
-                ValidationIssue(
-                    object_name=dependent_object,
-                    object_type=dependent_type,
-                    column_name=referenced_column,
-                    issue_type="REMOVED_COLUMN",
-                )
-            )
-
-        elif referenced_column in changed_columns:
-            validation.issues.append(
-                ValidationIssue(
-                    object_name=dependent_object,
-                    object_type=dependent_type,
-                    column_name=referenced_column,
-                    issue_type="CHANGED_COLUMN",
-                )
-            )
 
     return validation
