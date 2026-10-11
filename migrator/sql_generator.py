@@ -1,3 +1,4 @@
+
 from .models import (
     Column,
     DatabaseObject,
@@ -16,6 +17,67 @@ def _is_physical_table(
     }
 
 
+def generate_grant_sql(
+    obj: DatabaseObject,
+) -> str:
+    """
+    Reapply captured grants to a recreated view or materialized view.
+
+    Only explicit grants captured in the snapshot are restored.
+    """
+    if obj.object_type not in {
+        "VIEW",
+        "MATERIALIZED VIEW",
+    }:
+        return ""
+
+    statements = []
+    object_name = qualified_name(
+        obj.schema,
+        obj.name,
+    )
+
+    allowed_privileges = {
+        "VIEW": {
+            "SELECT",
+            "INSERT",
+            "UPDATE",
+            "DELETE",
+        },
+        "MATERIALIZED VIEW": {
+            "SELECT",
+        },
+    }
+
+    for grant in obj.grants:
+        privilege = grant.privilege.upper()
+
+        if privilege not in allowed_privileges[obj.object_type]:
+            raise ValueError(
+                f"Unsupported privilege {privilege} "
+                f"for {obj.object_type}"
+            )
+
+        if grant.grantee.upper() == "PUBLIC":
+            grantee_sql = "PUBLIC"
+        else:
+            grantee_sql = quote_identifier(
+                grant.grantee,
+            )
+
+        statement = (
+            f"GRANT {privilege} ON TABLE {object_name} "
+            f"TO {grantee_sql}"
+        )
+
+        if grant.grantable:
+            statement += " WITH GRANT OPTION"
+
+        statements.append(statement + ";")
+
+    return "\n".join(statements)
+
+
 def generate_drop_sql(
     drop_order: list[int],
     objects: dict[int, DatabaseObject],
@@ -28,8 +90,7 @@ def generate_drop_sql(
 
         obj = objects[oid]
 
-        # Physical tables are managed externally and must never be
-        # dropped or recreated by the migration tool.
+        # Physical tables are externally managed.
         if _is_physical_table(obj):
             continue
 
@@ -151,18 +212,14 @@ def generate_create_sql(
 
         obj = objects[oid]
 
-        # Physical tables are managed externally and must never be
-        # created or otherwise modified by the migration tool.
+        # Never create or modify externally managed physical tables.
         if _is_physical_table(obj):
             continue
 
         definition = obj.definition
         columns = None
 
-        if (
-            root_oid is not None
-            and oid == root_oid
-        ):
+        if root_oid is not None and oid == root_oid:
             if proposed_definition is not None:
                 definition = proposed_definition
 
@@ -208,6 +265,11 @@ def generate_create_sql(
                 f"{index.definition};"
             )
 
+        grant_sql = generate_grant_sql(obj)
+
+        if grant_sql:
+            statements.append(grant_sql)
+
     return "\n".join(statements)
 
 
@@ -216,25 +278,15 @@ def generate_table_alter_sql(
     comparison: SchemaComparison,
 ) -> str:
     """
-    Generate in-place ALTER TABLE statements for physical tables.
+    Generate in-place ALTER TABLE statements.
 
     Supported:
       - ADD COLUMN
       - DROP COLUMN
 
-    Not currently supported:
-      - changing an existing column's data type
-      - changing an existing column's nullability
-
-    DROP COLUMN intentionally does NOT use CASCADE.
-
-    The migration executor drops known dependent views/materialized
-    views explicitly before this function runs, then recreates them
-    afterward. This keeps dependency management under the control of
-    the migration planner instead of PostgreSQL's implicit CASCADE
-    behavior.
+    Type and nullability changes are intentionally unsupported.
+    DROP COLUMN does not use CASCADE.
     """
-
     if obj.object_type not in {
         "TABLE",
         "PARTITIONED TABLE",
@@ -248,21 +300,13 @@ def generate_table_alter_sql(
         obj.name,
     )
 
-    # --------------------------------------------------------------
-    # DROP COLUMNS
-    #
-    # Dependencies have already been dropped by the executor.
-    # Therefore DROP COLUMN can safely run without CASCADE.
-    # --------------------------------------------------------------
     for change in comparison.removed:
         statements.append(
             f"ALTER TABLE {object_name}\n"
-            f"DROP COLUMN {quote_identifier(change.column_name)};"
+            f"DROP COLUMN "
+            f"{quote_identifier(change.column_name)};"
         )
 
-    # --------------------------------------------------------------
-    # ADD COLUMNS
-    # --------------------------------------------------------------
     for change in comparison.added:
         column = change.new_column
 
@@ -271,8 +315,8 @@ def generate_table_alter_sql(
 
         if not column.nullable:
             raise ValueError(
-                "Cannot automatically add a NOT NULL column without "
-                "a default value to a physical table: "
+                "Cannot automatically add a NOT NULL column "
+                "without a default value to a physical table: "
                 f"{obj.schema}.{obj.name}.{column.name}"
             )
 
@@ -282,12 +326,6 @@ def generate_table_alter_sql(
             f"{column.data_type};"
         )
 
-    # --------------------------------------------------------------
-    # TYPE / NULLABILITY CHANGES
-    #
-    # These remain intentionally unsupported because they require
-    # explicit conversion/default semantics.
-    # --------------------------------------------------------------
     if comparison.changed:
         changed = ", ".join(
             change.column_name
@@ -296,8 +334,7 @@ def generate_table_alter_sql(
 
         raise ValueError(
             "Automatic column type/nullability changes are not "
-            "supported yet for "
-            f"{object_name}: {changed}"
+            f"supported yet for {object_name}: {changed}"
         )
 
     return "\n".join(statements)
@@ -344,20 +381,17 @@ def generate_migration_sql(
 
     if drop_sql:
         sections.append(
-            "-- DROP OBJECTS\n"
-            + drop_sql
+            "-- DROP OBJECTS\n" + drop_sql
         )
 
     if alter_sql:
         sections.append(
-            "-- ALTER TABLES\n"
-            + alter_sql
+            "-- ALTER TABLES\n" + alter_sql
         )
 
     if create_sql:
         sections.append(
-            "-- CREATE OBJECTS\n"
-            + create_sql
+            "-- CREATE OBJECTS\n" + create_sql
         )
 
     return "\n\n".join(sections)
@@ -379,8 +413,7 @@ def generate_family_create_sql(
 
         obj = objects[oid]
 
-        # Physical tables are managed externally and must never be
-        # created or otherwise modified by the migration tool.
+        # Never create or modify externally managed physical tables.
         if _is_physical_table(obj):
             continue
 
@@ -431,6 +464,12 @@ def generate_family_create_sql(
                 f"{index.definition};"
             )
 
+        # Restore captured grants for managed-family objects too.
+        grant_sql = generate_grant_sql(obj)
+
+        if grant_sql:
+            statements.append(grant_sql)
+
     return "\n".join(statements)
 
 
@@ -459,14 +498,12 @@ def generate_family_migration_sql(
 
     if drop_sql:
         sections.append(
-            "-- DROP OBJECTS\n"
-            + drop_sql
+            "-- DROP OBJECTS\n" + drop_sql
         )
 
     if create_sql:
         sections.append(
-            "-- CREATE OBJECTS\n"
-            + create_sql
+            "-- CREATE OBJECTS\n" + create_sql
         )
 
     return "\n\n".join(sections)

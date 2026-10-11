@@ -38,6 +38,74 @@ def read_sql_files(paths):
     ]
 
 
+def print_permissions(migration_plan):
+    """Display explicit grants and effective access for recreated views."""
+    print("PERMISSIONS:")
+
+    view_types = {"VIEW", "MATERIALIZED VIEW"}
+    seen_objects = set()
+
+    # These are the views/MVs that the migration will recreate.
+    for oid in migration_plan.create_order:
+        obj = migration_plan.objects.get(oid)
+
+        if obj is None or obj.object_type not in view_types:
+            continue
+
+        key = (obj.schema, obj.name)
+        if key in seen_objects:
+            continue
+        seen_objects.add(key)
+
+        object_name = f"{obj.schema}.{obj.name}"
+        print(f"\n  {object_name} [{obj.object_type}]")
+
+        # Explicit ACL grants are the grants the migration can restore.
+        print("    Explicit grants:")
+        if obj.grants:
+            for grant in obj.grants:
+                grant_option = (
+                    " WITH GRANT OPTION"
+                    if grant.grantable
+                    else ""
+                )
+                print(
+                    f"      GRANT {grant.privilege.upper()} "
+                    f"TO {grant.grantee}{grant_option}"
+                )
+            print("    Migration action: restore explicit grants")
+        else:
+            print("      None found")
+            print("    Migration action: no explicit grants to restore")
+
+        # Effective access is informational, not a list of grants to create.
+        print("    Effective permissions:")
+        effective = getattr(obj, "effective_permissions", [])
+
+        if effective:
+            accessible = [
+                permission
+                for permission in effective
+                if permission.can_access
+            ]
+
+            if accessible:
+                for permission in accessible:
+                    print(
+                        f"      {permission.role}: "
+                        f"{permission.privilege.upper()}"
+                    )
+            else:
+                print("      No effective privileges detected")
+        else:
+            print("      Not available")
+
+    if not seen_objects:
+        print("  No views or materialized views will be recreated.")
+
+    print()
+
+
 def print_dependency_tree(
     db,
     root,
@@ -340,6 +408,7 @@ def plan(
         )
 
     print()
+    print_permissions(migration_plan)
 
     proposed_definition = (
         migration_plan.proposed_definitions.get(

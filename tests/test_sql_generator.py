@@ -4,6 +4,7 @@ from migrator.models import (
     ColumnChange,
     DatabaseObject,
     MigrationPlan,
+    ObjectGrant,
     SchemaComparison,
 )
 
@@ -11,6 +12,7 @@ from migrator.sql_generator import (
     generate_create_sql,
     generate_family_create_sql,
     generate_family_migration_sql,
+    generate_grant_sql,
     generate_migration_sql,
     generate_object_create_sql,
     generate_table_alter_sql,
@@ -473,3 +475,111 @@ def test_nullability_change_is_rejected():
             obj,
             comparison,
         )
+
+
+def test_generate_grant_sql_for_named_role():
+    obj = DatabaseObject(
+        oid=1,
+        schema="demo",
+        name="v_customer",
+        object_type="VIEW",
+        grants=[
+            ObjectGrant(
+                grantee="report_reader",
+                privilege="SELECT",
+            ),
+        ],
+    )
+
+    sql = generate_grant_sql(obj)
+
+    assert (
+        'GRANT SELECT ON TABLE "demo"."v_customer" '
+        'TO "report_reader";'
+    ) == sql
+
+
+def test_generate_grant_sql_for_public():
+    obj = DatabaseObject(
+        oid=1,
+        schema="demo",
+        name="v_customer",
+        object_type="VIEW",
+        grants=[
+            ObjectGrant(
+                grantee="PUBLIC",
+                privilege="SELECT",
+            ),
+        ],
+    )
+
+    sql = generate_grant_sql(obj)
+
+    assert (
+        'GRANT SELECT ON TABLE "demo"."v_customer" TO PUBLIC;'
+    ) == sql
+
+
+def test_generate_grant_sql_with_grant_option():
+    obj = DatabaseObject(
+        oid=1,
+        schema="demo",
+        name="v_customer",
+        object_type="VIEW",
+        grants=[
+            ObjectGrant(
+                grantee="report_admin",
+                privilege="SELECT",
+                grantable=True,
+            ),
+        ],
+    )
+
+    sql = generate_grant_sql(obj)
+
+    assert (
+        'GRANT SELECT ON TABLE "demo"."v_customer" '
+        'TO "report_admin" WITH GRANT OPTION;'
+    ) == sql
+
+
+def test_generate_grant_sql_returns_empty_without_grants():
+    obj = DatabaseObject(
+        oid=1,
+        schema="demo",
+        name="v_customer",
+        object_type="VIEW",
+        grants=[],
+    )
+
+    assert generate_grant_sql(obj) == ""
+
+
+def test_generate_create_sql_restores_grants_after_creation():
+    obj = DatabaseObject(
+        oid=1,
+        schema="demo",
+        name="v_customer",
+        object_type="VIEW",
+        definition="SELECT 1",
+        grants=[
+            ObjectGrant(
+                grantee="report_reader",
+                privilege="SELECT",
+            ),
+        ],
+    )
+
+    sql = generate_create_sql(
+        create_order=[1],
+        objects={1: obj},
+    )
+
+    create_position = sql.index(
+        'CREATE VIEW "demo"."v_customer"'
+    )
+    grant_position = sql.index(
+        'GRANT SELECT ON TABLE "demo"."v_customer"'
+    )
+
+    assert create_position < grant_position

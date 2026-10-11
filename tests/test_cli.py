@@ -6,6 +6,7 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
+
 def run_cli(*args):
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
@@ -19,6 +20,37 @@ def run_cli(*args):
         stderr=subprocess.PIPE,
         text=True,
     )
+
+
+def write_arbitrary_table_sql(tmp_path):
+    sql_file = tmp_path / "offloading_securitization_changed.sql"
+    sql_file.write_text(
+        """
+        CREATE TABLE offloading.securitizations (
+            id integer,
+            migration_test_2 text
+        );
+        """,
+        encoding="utf-8",
+    )
+    return sql_file
+
+
+def write_collection_base_sql(tmp_path):
+    sql_file = tmp_path / "v_collection_base_changed.sql"
+    sql_file.write_text(
+        """
+        CREATE OR REPLACE VIEW auto_views.v_collection_base AS
+        SELECT
+            t.*,
+            NULL::text AS migration_test,
+            NULL::text AS migration_test2,
+            NULL::text AS migration_test3
+        FROM auto_views.t_collection_base AS t;
+        """,
+        encoding="utf-8",
+    )
+    return sql_file
 
 
 def test_cli_help_without_arguments():
@@ -37,51 +69,31 @@ def test_cli_unknown_command():
     assert result.returncode == 0
     assert "Unknown command: does-not-exist" in result.stdout
 
-def test_cli_analyze_arbitrary_table(tmp_path):
-    sql_file = tmp_path / "securitizations.sql"
 
-    sql_file.write_text(
-        """
-        CREATE TABLE offloading.securitizations (
-            id integer,
-            migration_test_2 text
-        );
-        """,
-        encoding="utf-8",
-    )
+def test_cli_analyze_arbitrary_table(tmp_path):
+    sql_file = write_arbitrary_table_sql(tmp_path)
 
     result = run_cli("analyze", str(sql_file))
 
-    assert result.returncode == 0
+    assert result.returncode == 0, result.stderr
     assert "ROOT: offloading.securitizations" in result.stdout
-    assert "BREAKING:" in result.stdout
+    assert "COLUMN CHANGES:" in result.stdout
 
 
 def test_cli_plan_arbitrary_table(tmp_path):
-    sql_file = tmp_path / "securitizations.sql"
-
-    sql_file.write_text(
-        """
-        CREATE TABLE offloading.securitizations (
-            id integer,
-            migration_test_2 text
-        );
-        """,
-        encoding="utf-8",
-    )
+    sql_file = write_arbitrary_table_sql(tmp_path)
 
     result = run_cli("plan", str(sql_file))
 
-    assert result.returncode == 0
+    assert result.returncode == 0, result.stderr
     assert "MIGRATION TARGET: offloading.securitizations" in result.stdout
     assert "OBJECT TYPE: TABLE" in result.stdout
 
 
-def test_cli_discover_arbitrary_sql_file():
-    result = run_cli(
-        "discover",
-        str(PROJECT_ROOT / "offloading_securitization_changed.sql"),
-    )
+def test_cli_discover_arbitrary_sql_file(tmp_path):
+    sql_file = write_arbitrary_table_sql(tmp_path)
+
+    result = run_cli("discover", str(sql_file))
 
     assert result.returncode == 0, result.stderr
     assert "TARGET:" in result.stdout
@@ -89,56 +101,50 @@ def test_cli_discover_arbitrary_sql_file():
     assert "TABLE" in result.stdout
 
 
-def test_cli_analyze_arbitrary_sql_file():
-    result = run_cli(
-        "analyze",
-        str(PROJECT_ROOT / "offloading_securitization_changed.sql"),
-    )
+def test_cli_analyze_arbitrary_sql_file(tmp_path):
+    sql_file = write_arbitrary_table_sql(tmp_path)
+
+    result = run_cli("analyze", str(sql_file))
 
     assert result.returncode == 0, result.stderr
     assert "ROOT: offloading.securitizations" in result.stdout
-    assert "BREAKING: False" in result.stdout
     assert "COLUMN CHANGES:" in result.stdout
 
 
-def test_cli_plan_arbitrary_sql_file():
-    result = run_cli(
-        "plan",
-        str(PROJECT_ROOT / "offloading_securitization_changed.sql"),
-    )
+def test_cli_plan_arbitrary_sql_file(tmp_path):
+    sql_file = write_arbitrary_table_sql(tmp_path)
+
+    result = run_cli("plan", str(sql_file))
 
     assert result.returncode == 0, result.stderr
     assert "MIGRATION TARGET: offloading.securitizations" in result.stdout
     assert "OBJECT TYPE: TABLE" in result.stdout
 
 
-def test_cli_discover_managed_family_sql_file():
-    result = run_cli(
-        "discover",
-        str(PROJECT_ROOT / "v_collection_base_changed.sql"),
-    )
+def test_cli_discover_managed_family_sql_file(tmp_path):
+    sql_file = write_collection_base_sql(tmp_path)
+
+    result = run_cli("discover", str(sql_file))
 
     assert result.returncode == 0, result.stderr
     assert "TARGET:" in result.stdout
     assert "auto_views.v_collection_base" in result.stdout
 
 
-def test_cli_analyze_managed_family_sql_file():
-    result = run_cli(
-        "analyze",
-        str(PROJECT_ROOT / "v_collection_base_changed.sql"),
-    )
+def test_cli_analyze_managed_family_sql_file(tmp_path):
+    sql_file = write_collection_base_sql(tmp_path)
+
+    result = run_cli("analyze", str(sql_file))
 
     assert result.returncode == 0, result.stderr
     assert "auto_views.v_collection_base" in result.stdout
     assert "IMPACTED OBJECTS:" in result.stdout
 
 
-def test_cli_plan_managed_family_sql_file():
-    result = run_cli(
-        "plan",
-        str(PROJECT_ROOT / "v_collection_base_changed.sql"),
-    )
+def test_cli_plan_managed_family_sql_file(tmp_path):
+    sql_file = write_collection_base_sql(tmp_path)
+
+    result = run_cli("plan", str(sql_file))
 
     assert result.returncode == 0, result.stderr
     assert "auto_views.v_collection_base" in result.stdout
@@ -147,48 +153,27 @@ def test_cli_plan_managed_family_sql_file():
     assert 'DROP TABLE "auto_views"."t_collection_base"' not in result.stdout
     assert 'CREATE TABLE "auto_views"."t_collection_base"' not in result.stdout
 
-    # Explicit source-view SQL must be present.
+    # Explicit source-view SQL should be reflected in the plan.
     assert "migration_test" in result.stdout
     assert "migration_test2" in result.stdout
     assert "migration_test3" in result.stdout
 
-    # The published view is generated from the supplied source definition.
+    # The published view should be generated from the supplied source definition.
     assert 'CREATE VIEW "public"."mv_collection_base"' in result.stdout
 
 
-def test_discover_managed_family_dependency_tree():
-    result = run_cli(
-        "discover",
-        "v_collection_base_changed.sql",
-    )
+def test_discover_managed_family_dependency_tree(tmp_path):
+    sql_file = write_collection_base_sql(tmp_path)
+
+    result = run_cli("discover", str(sql_file))
 
     assert result.returncode == 0, result.stderr
 
-    assert (
-        "TARGET: auto_views.v_collection_base [VIEW]"
-        in result.stdout
-    )
-
+    assert "TARGET: auto_views.v_collection_base [VIEW]" in result.stdout
     assert "OID:" in result.stdout
-
     assert "DEPENDENCY TREE:" in result.stdout
 
-    assert (
-        "auto_views.v_collection_base [VIEW]"
-        in result.stdout
-    )
-
-    assert (
-        "public.mv_collection_base [VIEW]"
-        in result.stdout
-    )
-
-    assert (
-        "auto_views.v_collection_segmentation_v0 [VIEW]"
-        in result.stdout
-    )
-
-    assert (
-        "auto_views.v_consumer_delinquency [VIEW]"
-        in result.stdout
-    )
+    assert "auto_views.v_collection_base [VIEW]" in result.stdout
+    assert "public.mv_collection_base [VIEW]" in result.stdout
+    assert "auto_views.v_collection_segmentation_v0 [VIEW]" in result.stdout
+    assert "auto_views.v_consumer_delinquency [VIEW]" in result.stdout

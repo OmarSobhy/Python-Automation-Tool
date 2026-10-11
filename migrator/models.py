@@ -1,3 +1,4 @@
+
 from dataclasses import dataclass, field
 
 
@@ -16,6 +17,20 @@ class Index:
 
 
 @dataclass
+class ObjectGrant:
+    grantee: str
+    privilege: str
+    grantable: bool = False
+
+
+@dataclass
+class EffectivePermission:
+    role: str
+    privilege: str
+    can_access: bool
+
+
+@dataclass
 class DatabaseObject:
     oid: int
     schema: str
@@ -28,12 +43,18 @@ class DatabaseObject:
     columns: list[Column] = field(default_factory=list)
     indexes: list[Index] = field(default_factory=list)
     dependencies: list[int] = field(default_factory=list)
+    grants: list[ObjectGrant] = field(default_factory=list)
+    effective_permissions: list[EffectivePermission] = field(
+        default_factory=list
+    )
+
 
 @dataclass
 class ProposedObject:
     schema: str
     name: str
     sql: str
+
 
 @dataclass
 class Dependency:
@@ -65,10 +86,7 @@ class SchemaComparison:
 
     @property
     def is_breaking(self) -> bool:
-        return bool(
-            self.removed
-            or self.changed
-        )
+        return bool(self.removed or self.changed)
 
 
 @dataclass
@@ -89,9 +107,7 @@ class ValidationIssue:
 
 @dataclass
 class MigrationValidation:
-    issues: list[ValidationIssue] = field(
-        default_factory=list
-    )
+    issues: list[ValidationIssue] = field(default_factory=list)
 
     @property
     def is_valid(self) -> bool:
@@ -104,27 +120,13 @@ class MigrationPlan:
     root_name: str
     comparison: SchemaComparison
     is_family: bool = False
-    proposed_definitions: dict[int, str] = field(
-        default_factory=dict
-    )
-    proposed_columns: dict[int, list[Column]] = field(
-        default_factory=dict
-    )
-    objects: dict[int, DatabaseObject] = field(
-        default_factory=dict
-    )
-    impacted_objects: list[ImpactedObject] = field(
-        default_factory=list
-    )
-    drop_order: list[int] = field(
-        default_factory=list
-    )
-    create_order: list[int] = field(
-        default_factory=list
-    )
-    dependencies: list[Dependency] = field(
-        default_factory=list
-    )
+    proposed_definitions: dict[int, str] = field(default_factory=dict)
+    proposed_columns: dict[int, list[Column]] = field(default_factory=dict)
+    objects: dict[int, DatabaseObject] = field(default_factory=dict)
+    impacted_objects: list[ImpactedObject] = field(default_factory=list)
+    drop_order: list[int] = field(default_factory=list)
+    create_order: list[int] = field(default_factory=list)
+    dependencies: list[Dependency] = field(default_factory=list)
     validation: MigrationValidation = field(
         default_factory=MigrationValidation
     )
